@@ -25,6 +25,7 @@ import com.revenuecat.purchases.CustomerInfo
 import com.revenuecat.purchases.Offerings
 import com.revenuecat.purchases.Offering
 import com.revenuecat.purchases.PurchasesTransactionException
+import com.revenuecat.purchases.PurchasesErrorCode
 import com.revenuecat.purchases.interfaces.UpdatedCustomerInfoListener
 import com.revenuecat.purchases.awaitCustomerInfo
 import com.revenuecat.purchases.awaitOfferings
@@ -146,6 +147,7 @@ public enum StoreError: Error {
     case noProductsAvailable
     case packageNotFound
     case notConfigured
+    case paymentPending
 }
 
 extension StoreError: LocalizedError {
@@ -157,6 +159,7 @@ extension StoreError: LocalizedError {
         case .noProductsAvailable: return "No products available"
         case .packageNotFound: return "Package not found"
         case .notConfigured: return "RevenueCat is not configured"
+        case .paymentPending: return "Payment is pending approval"
         }
     }
 }
@@ -1063,13 +1066,18 @@ public struct RevenueCatFuse: @unchecked Sendable {
     #if !SKIP
     /// Purchase a package (iOS). Mirrors iOS `Purchases.purchase(package:)`.
     public func purchase(package: RCFusePackage) async throws -> RCFuseCustomerInfo {
-        let (_, customerInfo, userCancelled) = try await Purchases.shared.purchase(package: package.package)
+        do {
+            let (_, customerInfo, userCancelled) = try await Purchases.shared.purchase(package: package.package)
 
-        if userCancelled {
-            throw StoreError.userCancelled
+            if userCancelled {
+                throw StoreError.userCancelled
+            }
+
+            return RCFuseCustomerInfo(customerInfo: customerInfo)
+        } catch ErrorCode.paymentPendingError {
+            // Deferred purchase (e.g. Ask to Buy) — not a failure.
+            throw StoreError.paymentPending
         }
-
-        return RCFuseCustomerInfo(customerInfo: customerInfo)
     }
     #else
     /// Purchase a package (Android) — requires the host `Activity`, wrapped in
@@ -1089,6 +1097,10 @@ public struct RevenueCatFuse: @unchecked Sendable {
         } catch let error as PurchasesTransactionException {
             if error.userCancelled {
                 throw StoreError.userCancelled
+            }
+            if error.code == PurchasesErrorCode.PaymentPendingError {
+                // Deferred purchase (e.g. pending parental approval) — not a failure.
+                throw StoreError.paymentPending
             }
             throw error
         }
