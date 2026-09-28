@@ -28,6 +28,7 @@ import com.revenuecat.purchases.PurchasesTransactionException
 import com.revenuecat.purchases.PurchasesErrorCode
 import com.revenuecat.purchases.interfaces.UpdatedCustomerInfoListener
 import com.revenuecat.purchases.awaitCustomerInfo
+import com.revenuecat.purchases.awaitGetProducts
 import com.revenuecat.purchases.awaitOfferings
 import com.revenuecat.purchases.awaitLogIn
 import com.revenuecat.purchases.awaitLogOut
@@ -1056,6 +1057,34 @@ public struct RevenueCatFuse: @unchecked Sendable {
         #endif
     }
 
+    /// Fetch store products directly by identifier, without going through
+    /// offerings. Mirrors iOS `Purchases.products(_:)`.
+    ///
+    /// Android returns one `StoreProduct` per Play base plan, with identifiers
+    /// of the form `"productId:basePlanId"`.
+    public func getProducts(_ productIdentifiers: [String]) async -> [RCFuseStoreProduct] {
+        #if !SKIP
+        let products = await Purchases.shared.products(productIdentifiers)
+        return products.map { RCFuseStoreProduct(product: $0) }
+        #else
+        let ids: MutableList<String> = mutableListOf()
+        for id in productIdentifiers {
+            ids.add(id)
+        }
+        do {
+            let products = Purchases.sharedInstance.awaitGetProducts(ids)
+            var result: [RCFuseStoreProduct] = []
+            for product in products {
+                result.append(RCFuseStoreProduct(product: product))
+            }
+            return result
+        } catch {
+            // Mirror the non-throwing iOS API: unfetchable products are simply absent.
+            return []
+        }
+        #endif
+    }
+
     // `purchase` has divergent platform signatures (iOS doesn't need an
     // Activity; Android does). Both signatures are emitted by their respective
     // `#if` branch — the bridge generator only sees the Skip-side body (because
@@ -1090,6 +1119,52 @@ public struct RevenueCatFuse: @unchecked Sendable {
 
         let kotlinPackage = package.kotlin()
         let params = PurchaseParams.Builder(androidActivity, kotlinPackage).build()
+
+        do {
+            let result = Purchases.sharedInstance.awaitPurchase(params)
+            return RCFuseCustomerInfo(customerInfo: result.customerInfo)
+        } catch let error as PurchasesTransactionException {
+            if error.userCancelled {
+                throw StoreError.userCancelled
+            }
+            if error.code == PurchasesErrorCode.PaymentPendingError {
+                // Deferred purchase (e.g. pending parental approval) — not a failure.
+                throw StoreError.paymentPending
+            }
+            throw error
+        }
+    }
+    #endif
+
+    // `purchase(product:)` mirrors the divergent-signature pattern of
+    // `purchase(package:)` above, for products fetched via `getProducts(_:)`
+    // rather than offerings.
+
+    #if !SKIP
+    /// Purchase a store product directly (iOS). Mirrors iOS `Purchases.purchase(product:)`.
+    public func purchase(product: RCFuseStoreProduct) async throws -> RCFuseCustomerInfo {
+        do {
+            let (_, customerInfo, userCancelled) = try await Purchases.shared.purchase(product: product.product)
+
+            if userCancelled {
+                throw StoreError.userCancelled
+            }
+
+            return RCFuseCustomerInfo(customerInfo: customerInfo)
+        } catch ErrorCode.paymentPendingError {
+            // Deferred purchase (e.g. Ask to Buy) — not a failure.
+            throw StoreError.paymentPending
+        }
+    }
+    #else
+    /// Purchase a store product directly (Android) — requires the host
+    /// `Activity`, wrapped in `RCFuseAndroidActivity` like `purchase(package:activity:)`.
+    public func purchase(product: RCFuseStoreProduct, activity: RCFuseAndroidActivity) async throws -> RCFuseCustomerInfo {
+        guard let androidActivity = activity.activity as? android.app.Activity else {
+            throw StoreError.unknown
+        }
+
+        let params = PurchaseParams.Builder(androidActivity, product.kotlin()).build()
 
         do {
             let result = Purchases.sharedInstance.awaitPurchase(params)
